@@ -5,11 +5,11 @@
 services:
   scheduler:
     volumes:
-      # Monta a pasta dbt local dentro do container do scheduler
-      # O scheduler lê o código do dbt para gerar as tasks do DAG
-      - ./dbt/dw:/usr/local/airflow/dbt/dw
+      # Monta o projeto dbt (fonte única em 02.data_warehouse) dentro do container do scheduler
+      # O scheduler executa as tasks, que rodam o dbt sobre esse projeto
+      - ../02.data_warehouse/dw:/usr/local/airflow/dbt/dw
 
   dag-processor:
     volumes:
       # O dag-processor também precisa do projeto dbt para parsear o DAG
-      - ./dbt/dw:/usr/local/airflow/dbt/dw
+      - ../02.data_warehouse/dw:/usr/local/airflow/dbt/dw
