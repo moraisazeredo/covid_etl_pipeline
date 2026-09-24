@@ -1,0 +1,18 @@
+# dbt
+target/
+dbt_packages/
+logs/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Credenciais e variáveis de ambiente
+.env
+profiles.yml
+
+# Sistema / editor
+.DS_Store
+Thumbs.db
+.vscode/
