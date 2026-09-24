@@ -1,0 +1,23 @@
+# 1_local_setup/docker-compose.yml
+
+services:
+  postgres:
+    image: postgres:17             # Imagem oficial do PostgreSQL versão 17
+    container_name: dbt_postgres   # Nome fixo do container — use este nome nos logs
+    environment:
+      POSTGRES_USER: ${DBT_USER}       # Lê do .env
+      POSTGRES_PASSWORD: ${DBT_PASSWORD} # Lê do .env
+      POSTGRES_DB: dbt_db              # Cria este banco ao iniciar
+    ports:
+      - "5433:5432"    # Porta 5433 na sua máquina → porta 5432 dentro do container
+                       # Usamos 5433 para não conflitar com o Postgres interno do Airflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data  # Persistência: dados sobrevivem ao restart
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DBT_USER} -d dbt_db"]
+      interval: 5s   # Verifica a cada 5s se o banco está pronto
+      timeout: 5s
+      retries: 5     # 5 tentativas antes de marcar como unhealthy
+
+volumes:
+  postgres_data:     # Volume nomeado gerenciado pelo Docker

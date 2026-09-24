@@ -1,0 +1,13 @@
+[project]
+name = "1-local-setup"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "dbt-core>=1.10.15",       # Core do dbt
+    "dbt-postgres>=1.9.1",     # Adaptador PostgreSQL para o dbt
+    "duckdb>=1.4.3",           # Banco analítico local (opcional, para exploração)
+    "faker>=38.2.0",           # Geração de dados fictícios
+    "matplotlib>=3.11.2",
+    "numpy>=2.3.5",
+    "pandas>=2.3.3",
+]
