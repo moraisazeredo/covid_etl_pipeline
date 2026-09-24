@@ -1,6 +1,6 @@
 # Projeto Prático de Engenharia de Dados
 
-Pipeline de dados ponta a ponta sobre **atrasos de voos nos EUA**: os dados brutos são carregados em um PostgreSQL, transformados em um Data Warehouse com **dbt** (camadas staging → intermediate → mart) e orquestrados diariamente pelo **Apache Airflow** (via Astro CLI + Astronomer Cosmos).
+Pipeline de dados ponta a ponta sobre **atrasos de voos nos EUA**: um CSV atualizado diariamente é carregado em um PostgreSQL, transformado em um Data Warehouse com **dbt** (camadas staging → intermediate → mart) e orquestrados diariamente pelo **Apache Airflow** (via Astro CLI + Astronomer Cosmos).
 
 ---
 
@@ -28,8 +28,8 @@ O projeto é dividido em três etapas, cada uma em sua própria pasta:
 | Etapa | Pasta | O que faz |
 |---|---|---|
 | 1 | `01.local_setup` | Sobe o PostgreSQL (Docker) que funciona como Data Warehouse e prepara o ambiente Python com o dbt |
-| 2 | `02.data_warehouse` | Projeto dbt: carrega o CSV (seed) e cria as tabelas/views de staging, intermediate e mart |
-| 3 | `03.airflow` | Airflow rodando via Astro CLI; o Cosmos transforma o projeto dbt em uma DAG com uma task por modelo |
+| 2 | `02.data_warehouse` | Projeto dbt (fonte única): lê a tabela `raw` e cria as tabelas/views de staging, intermediate e mart |
+| 3 | `03.airflow` | Airflow rodando via Astro CLI: carrega o CSV do dia na tabela `raw` e, em seguida, o Cosmos executa o dbt com uma task por modelo |
 
 **Resultado final:** tabelas analíticas (marts) prontas para consumo por ferramentas de BI, com KPIs mensais, desempenho por companhia aérea, por aeroporto e por causa de atraso — atualizadas automaticamente todos os dias.
 
@@ -40,43 +40,48 @@ O projeto é dividido em três etapas, cada uma em sua própria pasta:
 ```mermaid
 flowchart LR
     subgraph Fonte
-        CSV[(Airline_Delay_Cause.csv<br/>BTS - EUA)]
+        CSV[(include/data/<br/>airline_delay_cause.csv<br/>substituído diariamente)]
     end
 
-    subgraph Airflow["Airflow (Astro CLI - Docker)"]
-        DAG[DAG dag_dw_dev / dag_dw_prod<br/>gerada pelo Cosmos]
-        VENV[dbt_venv<br/>dbt-postgres 1.9]
-        DAG -->|executa| VENV
+    subgraph Airflow["Airflow (Astro CLI - Docker) - DAG dag_dw_dev / dag_dw_prod"]
+        LOAD[task load_csv<br/>TRUNCATE + COPY]
+        DBT[task group dbt_dw<br/>gerado pelo Cosmos]
+        LOAD --> DBT
     end
 
     subgraph DW["PostgreSQL 17 - dbt_db (Docker, porta 5433)"]
-        SEED[seed<br/>Airline_Delay_Cause]
+        RAW[raw.airline_delay_cause<br/>tabela bruta]
         STG[staging<br/>views]
         INT[intermediate<br/>tabelas - modelo estrela]
         MART[mart<br/>tabelas agregadas]
-        SEED --> STG --> INT --> MART
+        RAW --> STG --> INT --> MART
     end
 
-    CSV -->|dbt seed| SEED
-    VENV -->|dbt seed / run / test| DW
+    CSV --> LOAD
+    LOAD -->|COPY| RAW
+    DBT -->|dbt run / test<br/>dbt_venv| STG
     MART --> BI[Ferramentas de BI / análises]
 ```
 
 ### Fluxo de execução
 
-1. O Airflow lê `dags/dag.py`. O **Cosmos** (`DbtDag`) inspeciona o projeto dbt montado em `/usr/local/airflow/dbt/dw` e cria **uma task para cada seed e modelo**, respeitando as dependências declaradas com `ref()`.
-2. Diariamente (`@daily`), o scheduler dispara a DAG.
-3. Cada task:
-   1. gera um `profiles.yml` temporário a partir da **conexão do Airflow** (`docker_postgres_db` ou `railway_postgres_db`);
-   2. roda `dbt deps` (instala `dbt_utils`, `dbt_expectations`);
-   3. executa o executável `dbt_venv/bin/dbt` com o comando daquele nó (`seed`, `run --select <modelo>`, `test`).
+1. Todo dia, o arquivo `03.airflow/include/data/airline_delay_cause.csv` é substituído pela versão mais recente.
+2. O Airflow lê `dags/dag.py`. O **Cosmos** (`DbtTaskGroup`) inspeciona o projeto dbt (`02.data_warehouse/dw`, montado em `/usr/local/airflow/dbt/dw`) e cria **uma task para cada modelo**, respeitando as dependências declaradas com `ref()` e `source()`.
+3. Diariamente (`@daily`), o scheduler dispara a DAG:
+   1. **`load_csv`** — cria o schema/tabela `raw.airline_delay_cause` (se não existir), faz `TRUNCATE` e carrega o CSV com `COPY`, tudo em uma única transação;
+   2. **`dbt_dw`** — só começa depois da carga. Cada task do grupo:
+      1. gera um `profiles.yml` temporário a partir da **conexão do Airflow** (`docker_postgres_db` ou `railway_postgres_db`);
+      2. roda `dbt deps` (instala `dbt_utils`, `dbt_expectations`);
+      3. executa `dbt_venv/bin/dbt run --select <modelo>` (e `test`, quando houver testes).
 4. O dbt conecta no PostgreSQL e materializa as views/tabelas em cada camada.
+
+> **Por que não usar `dbt seed`?** Seeds são feitos para tabelas pequenas e estáticas (de-paras, listas de códigos). Um CSV de ~42 MB substituído todo dia é **ingestão**: o `dbt seed` insere os dados em lotes e fica muito lento nesse volume, enquanto o `COPY` nativo do Postgres faz a carga em massa em uma única operação.
 
 ### Linhagem dos modelos (DAG do dbt)
 
 ```mermaid
 flowchart LR
-    seed[Airline_Delay_Cause<br/><i>seed</i>] --> stg[stg_airline_delay_cause]
+    raw[raw.airline_delay_cause<br/><i>source</i>] --> stg[stg_airline_delay_cause]
 
     stg --> dim_month[int_dim_month]
     stg --> dim_carrier[int_dim_carrier]
@@ -124,29 +129,29 @@ projeto_engenharia_de_dados/
 │   └── .env                      # DBT_USER e DBT_PASSWORD (não versionar!)
 │
 ├── 02.data_warehouse/
-│   └── dw/                       # Projeto dbt
+│   └── dw/                       # Projeto dbt (fonte única, usado também pelo Airflow)
 │       ├── dbt_project.yml       # Configuração do projeto e materializações
 │       ├── packages.yml          # dbt_utils e dbt_expectations
 │       ├── profiles.yml          # Conexão local (ignorado pelo git)
-│       ├── seeds/
-│       │   └── Airline_Delay_Cause.csv
 │       └── models/
-│           ├── staging/          # Limpeza e tipagem (views)
+│           ├── staging/          # sources.yml (tabela raw) + limpeza e tipagem (views)
 │           ├── intermediate/     # Dimensões e fato (tabelas)
 │           └── mart/             # Agregações para BI (tabelas)
 │
 └── 03.airflow/                   # Projeto Astro (Airflow)
     ├── Dockerfile                # Imagem Astro Runtime + virtualenv com dbt
     ├── requirements.txt          # Pacotes Python do Airflow (cosmos, provider postgres)
-    ├── docker-compose.override.yml  # Monta ./dbt/dw dentro dos containers
+    ├── docker-compose.override.yml  # Monta ../02.data_warehouse/dw dentro dos containers
+    ├── .env                      # Timeouts de parse da DAG (ignorado pelo git)
     ├── .astro/config.yaml        # Porta do Postgres interno do Airflow (5435)
-    ├── dags/
-    │   └── dag.py                # DAG gerada pelo Cosmos
-    └── dbt/
-        └── dw/                   # Cópia do projeto dbt usada pelo Airflow
+    ├── include/
+    │   └── data/
+    │       └── airline_delay_cause.csv  # CSV substituído diariamente
+    └── dags/
+        └── dag.py                # load_csv + tasks do dbt geradas pelo Cosmos
 ```
 
-> **Atenção:** `03.airflow/dbt/dw` é uma **cópia** de `02.data_warehouse/dw`. Ao alterar modelos em `02.data_warehouse`, lembre-se de replicar a mudança em `03.airflow/dbt/dw`, pois é essa cópia que o Airflow executa.
+> O projeto dbt existe **em um único lugar** (`02.data_warehouse/dw`). O Airflow o enxerga por um volume do Docker, então alterações nos modelos valem imediatamente, sem rebuild da imagem.
 
 ---
 
@@ -154,8 +159,10 @@ projeto_engenharia_de_dados/
 
 **Fonte:** *Airline On-Time Statistics and Delay Causes* — Bureau of Transportation Statistics (BTS), Departamento de Transportes dos EUA.
 
-- Arquivo: `seeds/Airline_Delay_Cause.csv`
-- Volume: ~318 mil linhas
+- Arquivo: `03.airflow/include/data/airline_delay_cause.csv` (substituído diariamente, sempre com esse nome)
+- Tabela no banco: `raw.airline_delay_cause`
+- Volume: ~318 mil linhas (~42 MB)
+- **Não versionado:** o CSV está no `.gitignore` (muda todo dia e é grande). Baixe-o no site do BTS e salve no caminho acima.
 - Período: **jun/2003 a mai/2022**
 - Granularidade: **1 linha por mês × companhia aérea × aeroporto**
 
@@ -210,15 +217,15 @@ Instala `dbt-core`, `dbt-postgres` e bibliotecas de apoio (`pandas`, `numpy`, `d
 | `intermediate` | `table` | Consultada com frequência pelos marts |
 | `mart` | `table` | Consumo direto por BI, precisa ser rápida |
 
-### Seed
+### Source (camada raw)
 
-`Airline_Delay_Cause.csv` é carregado no banco com `dbt seed`, virando a tabela `Airline_Delay_Cause` — é a **camada raw** do projeto.
+A tabela `raw.airline_delay_cause` **não é criada pelo dbt**: ela é carregada pelo Airflow (task `load_csv`). O dbt apenas a declara como *source* em `models/staging/sources.yml` e a referencia com `{{ source('raw', 'airline_delay_cause') }}`. Assim, a linhagem do dbt começa na tabela bruta e a ingestão fica separada da transformação.
 
 ### Camada staging
 
 **`stg_airline_delay_cause`** (view)
 
-- Seleciona as colunas do seed e aplica **tipagem explícita** (`integer`, `numeric`, `text`).
+- Seleciona as colunas da tabela raw e aplica **tipagem explícita** (`integer`, `numeric`, `text`).
 - Cria a chave de tempo **`year_month_key`** = `year * 100 + month` (ex: `202205`).
 - Não altera a granularidade: continua 1 linha por mês × companhia × aeroporto.
 
@@ -311,31 +318,47 @@ Pacotes instalados no Python **principal** do Airflow:
 
 ### `docker-compose.override.yml`
 
-Monta a pasta local `./dbt/dw` em `/usr/local/airflow/dbt/dw` nos containers **scheduler** e **dag-processor**, para que o Cosmos consiga ler o projeto dbt (e alterações nos modelos apareçam sem rebuild da imagem).
+Monta a pasta `../02.data_warehouse/dw` em `/usr/local/airflow/dbt/dw` nos containers **scheduler** e **dag-processor**, para que o Cosmos consiga ler e executar o projeto dbt (e alterações nos modelos apareçam sem rebuild da imagem).
+
+> A pasta `include/` (onde fica o CSV) já é montada automaticamente pelo Astro em `/usr/local/airflow/include`.
+
+### `.env`
+
+Aumenta os limites de tempo para o Airflow ler a DAG (`AIRFLOW__CORE__DAGBAG_IMPORT_TIMEOUT` e `AIRFLOW__DAG_PROCESSOR__DAG_FILE_PROCESSOR_TIMEOUT` = 300 s). Na primeira leitura, o Cosmos roda `dbt deps` + `dbt ls` para descobrir os modelos, o que passa dos 30 s padrão; nas leituras seguintes ele usa cache.
 
 ### `.astro/config.yaml`
 
 Muda a porta do Postgres **interno** do Airflow (metadados) para `5435`, evitando conflito com o Postgres do Windows (`5432`) e com o Data Warehouse (`5433`).
 
-### `dags/dag.py` — como o dbt é executado
+### `dags/dag.py` — ingestão + dbt
 
-Não há nenhum `dbt run` escrito explicitamente: quem executa o dbt é o **Cosmos**, através da classe `DbtDag`.
+A DAG tem duas partes, executadas em sequência (`load_csv() >> transform`):
+
+**1. `load_csv` (ingestão)** — task Python que usa o `PostgresHook` com a mesma conexão do ambiente:
+
+1. `create schema if not exists raw` + `create table if not exists raw.airline_delay_cause`;
+2. `truncate table raw.airline_delay_cause`;
+3. `COPY ... FROM STDIN (FORMAT csv, HEADER true)` com o arquivo do dia;
+4. imprime a quantidade de linhas carregadas no log.
+
+Tudo acontece em **uma única transação**: se o arquivo do dia vier com problema e o `COPY` falhar, o `TRUNCATE` é desfeito e a tabela mantém os dados do dia anterior.
+
+**2. `dbt_dw` (transformação)** — não há nenhum `dbt run` escrito explicitamente: quem executa o dbt é o **Cosmos**, através da classe `DbtTaskGroup`.
 
 | Bloco | O que faz |
 |---|---|
 | `ProfileConfig` (dev/prod) | Gera o `profiles.yml` do dbt a partir de uma **conexão do Airflow** (`PostgresUserPasswordProfileMapping`) — as credenciais ficam no Airflow, não no código |
-| `Variable.get("dbt_env")` | Lê a variável `dbt_env` do Airflow (`dev` por padrão) e escolhe o perfil |
+| `Variable.get("dbt_env")` | Lê a variável `dbt_env` do Airflow (`dev` por padrão) e escolhe o perfil/conexão |
 | `ProjectConfig` | Caminho do projeto dbt dentro do container: `/usr/local/airflow/dbt/dw` |
 | `ExecutionConfig` | Caminho do executável: `$AIRFLOW_HOME/dbt_venv/bin/dbt` |
 | `operator_args` | `install_deps=True` (roda `dbt deps`) e `target` (dev/prod) |
-| `schedule="@daily"` | Execução diária, `catchup=False`, 2 retries por task |
+| `@dag(schedule="@daily")` | Execução diária, `catchup=False`, 2 retries por task |
 | `dag_id` | `dag_dw_dev` ou `dag_dw_prod`, conforme o ambiente |
 
 Ao carregar o arquivo, o Cosmos lê o projeto dbt e gera automaticamente:
 
-- uma task `seed` para o CSV;
 - um grupo de tasks por modelo (`run` e, quando houver testes declarados, `test`);
-- as dependências entre elas, seguindo os `ref()` do SQL.
+- as dependências entre elas, seguindo os `ref()` e `source()` do SQL.
 
 Nos **logs** de cada task, na interface do Airflow, dá para ver o comando dbt completo que foi montado e a saída do dbt.
 
@@ -367,6 +390,8 @@ docker compose up -d
 
 ### 2. (Opcional) Rodar o dbt manualmente
 
+> Requer que a tabela `raw.airline_delay_cause` já exista, ou seja, que a DAG tenha rodado ao menos uma vez (passo 5).
+
 Crie `02.data_warehouse/dw/profiles.yml` (ele é ignorado pelo git):
 
 ```yaml
@@ -396,6 +421,15 @@ uv run --project ../../01.local_setup dbt build --profiles-dir .
 
 ### 3. Subir o Airflow
 
+Coloque o CSV em `03.airflow/include/data/airline_delay_cause.csv` e crie o arquivo `03.airflow/.env`:
+
+```env
+AIRFLOW__CORE__DAGBAG_IMPORT_TIMEOUT=300
+AIRFLOW__DAG_PROCESSOR__DAG_FILE_PROCESSOR_TIMEOUT=300
+```
+
+Depois:
+
 ```bash
 cd 03.airflow
 astro dev start
@@ -403,7 +437,7 @@ astro dev start
 
 A interface fica em **http://localhost:8080**.
 
-> Sempre que alterar `requirements.txt`, `packages.txt` ou `Dockerfile`, rode `astro dev restart` para reconstruir a imagem.
+> Sempre que alterar `requirements.txt`, `packages.txt`, `Dockerfile`, `.env` ou `docker-compose.override.yml`, rode `astro dev restart`.
 
 ### 4. Criar a conexão no Airflow
 
@@ -423,11 +457,18 @@ Em **Admin → Connections → Add Connection**:
 
 ### 5. Executar a DAG
 
-Ative e dispare a DAG **`dag_dw_dev`** na interface. Ao final, as tabelas estarão em `dbt_db.public`:
+Ative e dispare a DAG **`dag_dw_dev`** na interface. No log da task `load_csv` aparece `Linhas carregadas: ...`. Ao final, a tabela bruta estará em `dbt_db.raw` e os modelos em `dbt_db.public`:
 
 ```sql
+select count(*) from raw.airline_delay_cause;
 select * from public.mart_monthly_kpis order by month_id;
 ```
+
+### Rotina diária
+
+Basta substituir `03.airflow/include/data/airline_delay_cause.csv` pelo arquivo novo (mantendo o nome). Na próxima execução agendada, a DAG recarrega a tabela raw e reconstrói todas as camadas.
+
+Para cancelar uma execução em andamento: abra a execução → **Mark Run as… → Failed**. Para rodar novamente: **Trigger** (do zero) ou **Clear Run → Only failed tasks** (retoma de onde parou).
 
 ---
 
@@ -462,5 +503,8 @@ Para usar prod, crie a conexão `railway_postgres_db` com os dados do banco no R
 | Tipo de conexão **Postgres** não aparece no Airflow | `apache-airflow-providers-postgres` não instalado (ou `requirements.txt` com nome errado) | Adicionar ao `requirements.txt` e rodar `astro dev restart` |
 | `connection refused` ao conectar no banco | Host `localhost` na conexão, ou container `dbt_postgres` parado | Usar `host.docker.internal:5433` e `docker compose up -d` em `01.local_setup` |
 | DAG não aparece / erro de import | Projeto dbt não montado ou `dbt_env` inválido | Conferir `docker-compose.override.yml` e a variável `dbt_env` (`dev` ou `prod`) |
-| Mudança em um modelo não reflete no Airflow | Alteração feita só em `02.data_warehouse` | Replicar em `03.airflow/dbt/dw` |
+| `DagBag import timeout ... after 30.0s` | Cosmos demora na primeira leitura do projeto dbt | Criar o `03.airflow/.env` com os timeouts de 300 s e rodar `astro dev restart` |
+| `load_csv` falha com `No such file or directory` | CSV fora do lugar ou com outro nome | Salvar em `03.airflow/include/data/airline_delay_cause.csv` |
+| `relation "raw.airline_delay_cause" does not exist` ao rodar o dbt manualmente | A DAG ainda não rodou nenhuma vez | Disparar a DAG (a `load_csv` cria a tabela) |
+| DAG demora muitos minutos na carga | Uso de `dbt seed` para arquivos grandes | Carregar via `COPY` (task `load_csv`), como neste projeto |
 | Conflito de porta ao subir containers | Outro serviço usando 5432/5433/5435 | Ajustar as portas no `docker-compose.yml` ou em `.astro/config.yaml` |
