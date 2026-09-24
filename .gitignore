@@ -8,6 +8,9 @@ logs/
 __pycache__/
 *.pyc
 
+# Dados — o CSV é substituído diariamente e não deve ser versionado
+03.airflow/include/data/*.csv
+
 # Credenciais e variáveis de ambiente
 .env
 profiles.yml

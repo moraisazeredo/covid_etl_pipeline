@@ -1,0 +1,9 @@
+# models/staging/sources.yml
+version: 2
+
+sources:
+  - name: raw
+    schema: raw   # Schema criado pela task load_csv da DAG (fora do dbt)
+    tables:
+      - name: airline_delay_cause
+        description: "CSV do BTS carregado diariamente pelo Airflow via COPY (truncate + load)"

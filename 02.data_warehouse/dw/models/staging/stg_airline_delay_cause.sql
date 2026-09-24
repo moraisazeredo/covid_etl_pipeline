@@ -22,7 +22,7 @@ with src as (
         nas_delay,
         security_delay,
         late_aircraft_delay
-    from {{ ref('Airline_Delay_Cause') }}
+    from {{ source('raw', 'airline_delay_cause') }}  -- Tabela carregada pela task load_csv do Airflow
 
 ),
 
