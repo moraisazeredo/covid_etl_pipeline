@@ -1,0 +1,15 @@
+# 3_airflow/docker-compose.override.yml
+# A porta do Postgres interno do Airflow é controlada pelo .astro/config.yaml
+# (porta 5435) — não precisa declarar aqui para evitar mapeamento duplicado.
+
+services:
+  scheduler:
+    volumes:
+      # Monta a pasta dbt local dentro do container do scheduler
+      # O scheduler lê o código do dbt para gerar as tasks do DAG
+      - ./dbt/dw:/usr/local/airflow/dbt/dw
+
+  dag-processor:
+    volumes:
+      # O dag-processor também precisa do projeto dbt para parsear o DAG
+      - ./dbt/dw:/usr/local/airflow/dbt/dw

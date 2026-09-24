@@ -1,0 +1,6 @@
+# 3_airflow/.astro/config.yaml
+project:
+    name: 3-airflow
+postgres:
+    port: 5435   # Evita conflito com PostgreSQL instalado no Windows (5432)
+                 # e com o dbt_postgres do módulo 1 (5433)
