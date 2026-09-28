@@ -530,21 +530,3 @@ A mesma conexão é usada pela `load_raw` e pelo dbt: em dev tudo vai para o ban
 | `5433` | PostgreSQL do Data Warehouse (`dbt_postgres`) |
 | `5435` | PostgreSQL interno do Airflow (metadados) |
 | `8080` | Interface web do Airflow |
-
----
-
-## Problemas comuns
-
-| Sintoma | Causa | Solução |
-|---|---|---|
-| Tipo de conexão **Postgres** não aparece no Airflow | `apache-airflow-providers-postgres` não instalado (ou `requirements.txt` com nome errado) | Adicionar ao `requirements.txt` e rodar `astro dev restart` |
-| `connection refused` ao conectar no banco | Host `localhost` na conexão, ou container `dbt_postgres` parado | Usar `host.docker.internal:5433` e `docker compose up -d` em `01.local_setup` |
-| DAG não aparece / erro de import | Projeto dbt não montado, `ref()` para modelo inexistente ou `dbt_env` inválido | `astro dev run dags list-import-errors`; conferir `docker-compose.override.yml`, os `ref()` e a variável `dbt_env` |
-| `DagBag import timeout ... after 30.0s` | Cosmos demora na primeira leitura do projeto dbt | Criar o `03.airflow/.env` com os timeouts de 300 s e rodar `astro dev restart` |
-| `extract_api` falha com `404 Not Found` | Nome de país não reconhecido pela API (com `strict=true`) | Usar o nome exato da API ou o código ISO de 2 letras (ex.: `US`, `GB`, `KR`) |
-| `extract_api` falha com `colunas ausentes na resposta` | A API mudou/removeu um campo | Ajustar `COLUNAS_API`, o `RAW_DDL` e o staging |
-| `relation "raw.covid_countries" does not exist` ao rodar o dbt manualmente | A DAG ainda não rodou nenhuma vez | Disparar a DAG (a `load_raw` cria a tabela) |
-| `column "casesperonemillion" does not exist` | SQL usando os nomes camelCase da API | Na raw as colunas são snake_case (`cases_per_one_million`) |
-| `UnicodeDecodeError: 'charmap' codec` ao rodar o dbt no Windows | Python lendo arquivos em `cp1252` | Definir `PYTHONUTF8=1` e reabrir o terminal |
-| `new_cases` vazio | Primeiro dia de carga | Normal: aparece a partir do segundo retrato |
-| Conflito de porta ao subir containers | Outro serviço usando 5432/5433/5435 | Ajustar as portas no `docker-compose.yml` ou em `.astro/config.yaml` |
