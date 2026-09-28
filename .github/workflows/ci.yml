@@ -1,0 +1,163 @@
+name: CI — dbt Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  DBT: ../../01.local_setup/.venv/bin/dbt  # dbt instalado pelo uv sync em 01.local_setup
+
+jobs:
+  dbt-compile:
+    name: Compilar modelos dbt (validação de sintaxe)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Instalar UV
+        run: pip install uv
+
+      - name: Instalar dependências Python
+        working-directory: 01.local_setup
+        run: uv sync
+
+      - name: Criar profiles.yml para validação
+        working-directory: 02.data_warehouse/dw
+        run: |
+          cat > profiles.yml << 'EOF'
+          dw:
+            target: dev
+            outputs:
+              dev:
+                type: postgres
+                host: localhost
+                port: 5433
+                user: postgres
+                password: postgres
+                dbname: dbt_db
+                schema: public
+                threads: 4
+          EOF
+
+      - name: Instalar pacotes dbt (dbt deps)
+        working-directory: 02.data_warehouse/dw
+        run: $DBT deps --profiles-dir .
+
+      - name: Validar sintaxe dos modelos dbt (dbt parse)
+        working-directory: 02.data_warehouse/dw
+        run: $DBT parse --profiles-dir .
+
+  dbt-build:
+    name: Executar pipeline completo (run + test)
+    runs-on: ubuntu-latest
+    needs: dbt-compile
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: dbt_db
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d dbt_db"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Instalar UV
+        run: pip install uv
+
+      - name: Instalar dependências Python
+        working-directory: 01.local_setup
+        run: uv sync
+
+      - name: Criar profiles.yml apontando para o PostgreSQL do CI
+        working-directory: 02.data_warehouse/dw
+        run: |
+          cat > profiles.yml << 'EOF'
+          dw:
+            target: dev
+            outputs:
+              dev:
+                type: postgres
+                host: localhost
+                port: 5433
+                user: postgres
+                password: postgres
+                dbname: dbt_db
+                schema: public
+                threads: 4
+          EOF
+
+      # No projeto real a tabela raw é criada pela task load_raw da DAG (Airflow).
+      # No CI criamos a mesma estrutura (vazia) para os models conseguirem rodar.
+      - name: Criar tabela raw.covid_countries
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -p 5433 -U postgres -d dbt_db -v ON_ERROR_STOP=1 << 'EOF'
+          create schema if not exists raw;
+          create table if not exists raw.covid_countries (
+              snapshot_date             date,
+              country                   text,
+              cases                     numeric,
+              deaths                    numeric,
+              recovered                 numeric,
+              active                    numeric,
+              critical                  numeric,
+              cases_per_one_million     numeric,
+              deaths_per_one_million    numeric,
+              tests                     numeric,
+              tests_per_one_million     numeric,
+              population                numeric,
+              one_case_per_people       numeric,
+              one_death_per_people      numeric,
+              one_test_per_people       numeric,
+              active_per_one_million    numeric,
+              recovered_per_one_million numeric
+          );
+          EOF
+
+      - name: Instalar pacotes dbt (dbt deps)
+        working-directory: 02.data_warehouse/dw
+        run: $DBT deps --profiles-dir .
+
+      - name: Testar conexão com o banco (dbt debug)
+        working-directory: 02.data_warehouse/dw
+        run: $DBT debug --profiles-dir .
+
+      - name: Executar models e testes (dbt build)
+        working-directory: 02.data_warehouse/dw
+        run: $DBT build --profiles-dir .
+
+      - name: Gerar documentação dbt
+        working-directory: 02.data_warehouse/dw
+        run: $DBT docs generate --profiles-dir .
+
+      - name: Publicar artefatos de documentação
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbt-docs
+          path: 02.data_warehouse/dw/target/
+          retention-days: 7
