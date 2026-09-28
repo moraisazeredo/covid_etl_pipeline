@@ -1,6 +1,6 @@
 # Projeto Prático de Engenharia de Dados
 
-Pipeline de dados ponta a ponta sobre **atrasos de voos nos EUA**: um CSV atualizado diariamente é carregado em um PostgreSQL, transformado em um Data Warehouse com **dbt** (camadas staging → intermediate → mart) e orquestrados diariamente pelo **Apache Airflow** (via Astro CLI + Astronomer Cosmos).
+Pipeline de dados ponta a ponta sobre **COVID-19 em 20 países**: todos os dias, uma API pública é consultada, o resultado é carregado em um PostgreSQL, transformado em um Data Warehouse com **dbt** (camadas staging → intermediate → mart) e tudo é orquestrado pelo **Apache Airflow** (via Astro CLI + Astronomer Cosmos).
 
 ---
 
@@ -28,10 +28,10 @@ O projeto é dividido em três etapas, cada uma em sua própria pasta:
 | Etapa | Pasta | O que faz |
 |---|---|---|
 | 1 | `01.local_setup` | Sobe o PostgreSQL (Docker) que funciona como Data Warehouse e prepara o ambiente Python com o dbt |
-| 2 | `02.data_warehouse` | Projeto dbt (fonte única): lê a tabela `raw` e cria as tabelas/views de staging, intermediate e mart |
-| 3 | `03.airflow` | Airflow rodando via Astro CLI: carrega o CSV do dia na tabela `raw` e, em seguida, o Cosmos executa o dbt com uma task por modelo |
+| 2 | `02.data_warehouse` | Projeto dbt (fonte única): lê a tabela `raw` e cria as views/tabelas de staging, intermediate e mart |
+| 3 | `03.airflow` | Airflow rodando via Astro CLI: consulta a API, grava o resultado em CSV, carrega na tabela `raw` e, em seguida, o Cosmos executa o dbt com uma task por modelo |
 
-**Resultado final:** tabelas analíticas (marts) prontas para consumo por ferramentas de BI, com KPIs mensais, desempenho por companhia aérea, por aeroporto e por causa de atraso — atualizadas automaticamente todos os dias.
+**Resultado final:** tabelas analíticas (marts) prontas para BI — situação atual e rankings por país, evolução diária com média móvel e KPIs consolidados — atualizadas automaticamente todos os dias, **acumulando um histórico diário** a partir da primeira execução.
 
 ---
 
@@ -40,24 +40,28 @@ O projeto é dividido em três etapas, cada uma em sua própria pasta:
 ```mermaid
 flowchart LR
     subgraph Fonte
-        CSV[(include/data/<br/>airline_delay_cause.csv<br/>substituído diariamente)]
+        API[(API disease.sh<br/>/v3/covid-19/countries)]
     end
 
     subgraph Airflow["Airflow (Astro CLI - Docker) - DAG dag_dw_dev / dag_dw_prod"]
-        LOAD[task load_csv<br/>TRUNCATE + COPY]
+        EXT[task extract_api<br/>API → CSV]
+        LOAD[task load_raw<br/>DELETE do dia + COPY]
         DBT[task group dbt_dw<br/>gerado pelo Cosmos]
-        LOAD --> DBT
+        EXT --> LOAD --> DBT
     end
 
+    CSV[(include/data/<br/>covid_countries_AAAA-MM-DD.csv)]
+
     subgraph DW["PostgreSQL 17 - dbt_db (Docker, porta 5433)"]
-        RAW[raw.airline_delay_cause<br/>tabela bruta]
-        STG[staging<br/>views]
+        RAW[raw.covid_countries<br/>1 retrato por dia]
+        STG[staging<br/>view]
         INT[intermediate<br/>tabelas - modelo estrela]
-        MART[mart<br/>tabelas agregadas]
+        MART[mart<br/>tabelas analíticas]
         RAW --> STG --> INT --> MART
     end
 
-    CSV --> LOAD
+    API --> EXT
+    EXT --> CSV --> LOAD
     LOAD -->|COPY| RAW
     DBT -->|dbt run / test<br/>dbt_venv| STG
     MART --> BI[Ferramentas de BI / análises]
@@ -65,40 +69,35 @@ flowchart LR
 
 ### Fluxo de execução
 
-1. Todo dia, o arquivo `03.airflow/include/data/airline_delay_cause.csv` é substituído pela versão mais recente.
-2. O Airflow lê `dags/dag.py`. O **Cosmos** (`DbtTaskGroup`) inspeciona o projeto dbt (`02.data_warehouse/dw`, montado em `/usr/local/airflow/dbt/dw`) e cria **uma task para cada modelo**, respeitando as dependências declaradas com `ref()` e `source()`.
-3. Diariamente (`@daily`), o scheduler dispara a DAG:
-   1. **`load_csv`** — cria o schema/tabela `raw.airline_delay_cause` (se não existir), faz `TRUNCATE` e carrega o CSV com `COPY`, tudo em uma única transação;
-   2. **`dbt_dw`** — só começa depois da carga. Cada task do grupo:
+1. O Airflow lê `dags/dag.py`. O **Cosmos** (`DbtTaskGroup`) inspeciona o projeto dbt (`02.data_warehouse/dw`, montado em `/usr/local/airflow/dbt/dw`) e cria **uma task para cada modelo e teste**, respeitando as dependências declaradas com `ref()` e `source()`.
+2. Diariamente (`@daily`), o scheduler dispara a DAG:
+   1. **`extract_api`** — consulta a API para cada um dos 20 países, mantém só as colunas de interesse e grava `include/data/covid_countries_<data>.csv`;
+   2. **`load_raw`** — cria o schema/tabela `raw.covid_countries` (se não existir), apaga o retrato do dia (se já houver) e carrega o CSV com `COPY`, tudo em uma única transação;
+   3. **`dbt_dw`** — só começa depois da carga. Cada task do grupo:
       1. gera um `profiles.yml` temporário a partir da **conexão do Airflow** (`docker_postgres_db` ou `railway_postgres_db`);
       2. roda `dbt deps` (instala `dbt_utils`, `dbt_expectations`);
-      3. executa `dbt_venv/bin/dbt run --select <modelo>` (e `test`, quando houver testes).
-4. O dbt conecta no PostgreSQL e materializa as views/tabelas em cada camada.
+      3. executa `dbt_venv/bin/dbt run --select <modelo>` ou `dbt test`.
+3. O dbt conecta no PostgreSQL e materializa as views/tabelas em cada camada.
 
-> **Por que não usar `dbt seed`?** Seeds são feitos para tabelas pequenas e estáticas (de-paras, listas de códigos). Um CSV de ~42 MB substituído todo dia é **ingestão**: o `dbt seed` insere os dados em lotes e fica muito lento nesse volume, enquanto o `COPY` nativo do Postgres faz a carga em massa em uma única operação.
+> **Por que um retrato por dia?** A API devolve apenas os **totais acumulados do momento** — não existe histórico nela. Se a tabela fosse sobrescrita (`TRUNCATE`), cada dia apagaria o anterior. Guardando uma linha por `snapshot_date` + `country`, o histórico cresce a cada execução e permite calcular variações diárias (`new_cases`, `new_deaths`).
 
 ### Linhagem dos modelos (DAG do dbt)
 
 ```mermaid
 flowchart LR
-    raw[raw.airline_delay_cause<br/><i>source</i>] --> stg[stg_airline_delay_cause]
+    raw[raw.covid_countries<br/><i>source</i>] --> stg[stg_covid_countries]
 
-    stg --> dim_month[int_dim_month]
-    stg --> dim_carrier[int_dim_carrier]
-    stg --> dim_airport[int_dim_airport]
-    stg --> fct[int_fct_flight_delays]
+    stg --> dim_country[int_dim_country]
+    stg --> dim_date[int_dim_date]
+    stg --> fct[int_fct_covid_daily]
 
-    fct --> kpis[mart_monthly_kpis]
-    dim_month --> kpis
+    fct --> latest[mart_country_latest]
+    dim_country --> latest
 
-    fct --> carrier_perf[mart_carrier_performance]
-    dim_carrier --> carrier_perf
+    fct --> daily[mart_country_daily]
+    dim_date --> daily
 
-    fct --> airport_perf[mart_airport_performance]
-    dim_airport --> airport_perf
-
-    fct --> causes_long[mart_delay_causes_long]
-    fct --> causes_share[mart_delay_causes_share_month]
+    fct --> global[mart_global_daily_kpis]
 ```
 
 ---
@@ -109,11 +108,12 @@ flowchart LR
 |---|---|---|
 | PostgreSQL | 17 (Docker) | Data Warehouse |
 | dbt-core / dbt-postgres | 1.10+ local / 1.9.0 no Airflow | Transformações SQL em camadas |
-| dbt_utils | 1.3.0 | Macros utilitárias |
+| dbt_utils | 1.3.0 | Macros e testes utilitários |
 | dbt_expectations | 0.10.8 | Testes avançados de qualidade de dados |
 | Apache Airflow | 3.x (Astro Runtime 3.1-8) | Orquestração |
 | Astro CLI | — | Sobe o Airflow localmente em Docker |
-| astronomer-cosmos | — | Converte o projeto dbt em DAG do Airflow |
+| astronomer-cosmos | — | Converte o projeto dbt em tasks do Airflow |
+| requests | — | Chamadas HTTP à API (já incluso no Airflow) |
 | uv | — | Gerenciador de ambiente/dependências Python (etapa 1) |
 | Docker / Docker Compose | — | Containers do Postgres e do Airflow |
 
@@ -134,9 +134,18 @@ projeto_engenharia_de_dados/
 │       ├── packages.yml          # dbt_utils e dbt_expectations
 │       ├── profiles.yml          # Conexão local (ignorado pelo git)
 │       └── models/
-│           ├── staging/          # sources.yml (tabela raw) + limpeza e tipagem (views)
-│           ├── intermediate/     # Dimensões e fato (tabelas)
-│           └── mart/             # Agregações para BI (tabelas)
+│           ├── staging/
+│           │   ├── sources.yml               # Declara raw.covid_countries
+│           │   └── stg_covid_countries.sql   # Tipagem (view)
+│           ├── intermediate/
+│           │   ├── _intermediate.yml         # Testes de qualidade
+│           │   ├── int_dim_country.sql
+│           │   ├── int_dim_date.sql
+│           │   └── int_fct_covid_daily.sql
+│           └── mart/
+│               ├── mart_country_latest.sql
+│               ├── mart_country_daily.sql
+│               └── mart_global_daily_kpis.sql
 │
 └── 03.airflow/                   # Projeto Astro (Airflow)
     ├── Dockerfile                # Imagem Astro Runtime + virtualenv com dbt
@@ -145,10 +154,9 @@ projeto_engenharia_de_dados/
     ├── .env                      # Timeouts de parse da DAG (ignorado pelo git)
     ├── .astro/config.yaml        # Porta do Postgres interno do Airflow (5435)
     ├── include/
-    │   └── data/
-    │       └── airline_delay_cause.csv  # CSV substituído diariamente
+    │   └── data/                 # CSVs gerados pela extract_api (ignorados pelo git)
     └── dags/
-        └── dag.py                # load_csv + tasks do dbt geradas pelo Cosmos
+        └── dag.py                # extract_api + load_raw + tasks do dbt (Cosmos)
 ```
 
 > O projeto dbt existe **em um único lugar** (`02.data_warehouse/dw`). O Airflow o enxerga por um volume do Docker, então alterações nos modelos valem imediatamente, sem rebuild da imagem.
@@ -157,30 +165,27 @@ projeto_engenharia_de_dados/
 
 ## Os dados
 
-**Fonte:** *Airline On-Time Statistics and Delay Causes* — Bureau of Transportation Statistics (BTS), Departamento de Transportes dos EUA.
+**Fonte:** [disease.sh](https://disease.sh) — API pública e gratuita (sem token) que consolida dados de COVID-19 de fontes oficiais.
 
-- Arquivo: `03.airflow/include/data/airline_delay_cause.csv` (substituído diariamente, sempre com esse nome)
-- Tabela no banco: `raw.airline_delay_cause`
-- Volume: ~318 mil linhas (~42 MB)
-- **Não versionado:** o CSV está no `.gitignore` (muda todo dia e é grande). Baixe-o no site do BTS e salve no caminho acima.
-- Período: **jun/2003 a mai/2022**
-- Granularidade: **1 linha por mês × companhia aérea × aeroporto**
+- Endpoint: `GET https://disease.sh/v3/covid-19/countries/{país}?strict=true`
+- Países monitorados (20): Brazil, USA, France, Germany, Italy, Spain, UK, Portugal, Argentina, Mexico, Canada, Chile, Colombia, Peru, India, China, Japan, S. Korea, Australia, South Africa — lista em `PAISES` no `dag.py`
+- Arquivo intermediário: `03.airflow/include/data/covid_countries_AAAA-MM-DD.csv` (um por dia, **não versionado**)
+- Tabela no banco: `raw.covid_countries`
+- Granularidade: **1 linha por dia de execução (`snapshot_date`) × país**
+- Os valores são **acumulados** desde o início da pandemia
 
-| Coluna | Descrição |
-|---|---|
-| `year`, `month` | Ano e mês de referência |
-| `carrier`, `carrier_name` | Código e nome da companhia aérea (ex: `AA` – American Airlines) |
-| `airport`, `airport_name` | Código IATA e nome do aeroporto (ex: `ATL`) |
-| `arr_flights` | Total de voos que chegaram |
-| `arr_del15` | Voos com 15+ minutos de atraso |
-| `arr_cancelled`, `arr_diverted` | Voos cancelados / desviados |
-| `arr_delay` | Minutos totais de atraso |
-| `carrier_delay` | Minutos de atraso por culpa da companhia (manutenção, tripulação) |
-| `weather_delay` | Minutos de atraso por clima |
-| `nas_delay` | Minutos de atraso pelo sistema aéreo nacional (controle de tráfego) |
-| `security_delay` | Minutos de atraso por segurança/triagem |
-| `late_aircraft_delay` | Minutos de atraso por aeronave atrasada do voo anterior |
-| `*_ct` | Contagem (fracionária) de ocorrências de cada causa |
+| Coluna (raw) | Campo na API | Descrição |
+|---|---|---|
+| `snapshot_date` | — | Dia em que o retrato foi extraído (UTC) |
+| `country` | `country` | Nome do país |
+| `cases`, `deaths`, `recovered` | idem | Totais acumulados de casos, mortes e recuperados |
+| `active`, `critical` | idem | Casos ativos e em estado crítico no momento |
+| `tests` | `tests` | Total de testes realizados |
+| `population` | `population` | População do país |
+| `cases_per_one_million`, `deaths_per_one_million`, `tests_per_one_million`, `active_per_one_million`, `recovered_per_one_million` | `*PerOneMillion` | Taxas por milhão de habitantes |
+| `one_case_per_people`, `one_death_per_people`, `one_test_per_people` | `one*PerPeople` | "1 caso/morte/teste a cada N pessoas" |
+
+> Na raw, os nomes são convertidos de camelCase (API) para snake_case, para não exigir aspas no SQL do Postgres.
 
 ---
 
@@ -219,77 +224,86 @@ Instala `dbt-core`, `dbt-postgres` e bibliotecas de apoio (`pandas`, `numpy`, `d
 
 ### Source (camada raw)
 
-A tabela `raw.airline_delay_cause` **não é criada pelo dbt**: ela é carregada pelo Airflow (task `load_csv`). O dbt apenas a declara como *source* em `models/staging/sources.yml` e a referencia com `{{ source('raw', 'airline_delay_cause') }}`. Assim, a linhagem do dbt começa na tabela bruta e a ingestão fica separada da transformação.
+A tabela `raw.covid_countries` **não é criada pelo dbt**: ela é carregada pelo Airflow (task `load_raw`). O dbt apenas a declara como *source* em `models/staging/sources.yml` e a referencia com `{{ source('raw', 'covid_countries') }}`. Assim, a linhagem do dbt começa na tabela bruta e a ingestão fica separada da transformação.
 
 ### Camada staging
 
-**`stg_airline_delay_cause`** (view)
+**`stg_covid_countries`** (view)
 
-- Seleciona as colunas da tabela raw e aplica **tipagem explícita** (`integer`, `numeric`, `text`).
-- Cria a chave de tempo **`year_month_key`** = `year * 100 + month` (ex: `202205`).
-- Não altera a granularidade: continua 1 linha por mês × companhia × aeroporto.
+- Seleciona as colunas da raw e aplica **tipagem explícita**:
+  - contagens (`cases`, `deaths`, `tests`, `population`…) como `bigint` — população e testes passam de 1 bilhão em alguns países, perto do limite do `integer`;
+  - taxas por milhão como `numeric`, preservando as casas decimais;
+  - `one_*_per_people` como `integer`.
+- Não altera a granularidade: continua 1 linha por dia × país.
 
 ### Camada intermediate — modelo dimensional (estrela)
 
 | Modelo | Tipo | Chave | Descrição |
 |---|---|---|---|
-| `int_dim_month` | Dimensão | `month_id` | Meses distintos (`year`, `month`) |
-| `int_dim_carrier` | Dimensão | `carrier_id` | Companhias aéreas; `max(carrier_name)` resolve nomes duplicados |
-| `int_dim_airport` | Dimensão | `airport_id` | Aeroportos; `max(airport_name)` resolve nomes duplicados |
-| `int_fct_flight_delays` | Fato | `month_id` + `carrier_id` + `airport_id` | Métricas de voos, atrasos em minutos e contagem por causa |
+| `int_dim_country` | Dimensão | `country_id` | Um registro por país, com `population` e `last_snapshot_date` do retrato mais recente (`row_number()`) |
+| `int_dim_date` | Dimensão | `date_id` | Um registro por dia de retrato: `year`, `month`, `day`, `day_of_week`, `year_month` |
+| `int_fct_covid_daily` | Fato | `date_id` + `country_id` | Totais acumulados, taxas por milhão e **variações diárias** (`new_cases`, `new_deaths`, `new_recovered`, `new_tests`) |
+
+As variações diárias são calculadas com `lag()`: o valor de hoje menos o do retrato anterior do mesmo país. No primeiro dia de carga elas ficam `null` (não há retrato anterior) e podem ser negativas se a fonte revisar os números.
 
 ```mermaid
 erDiagram
-    int_dim_month ||--o{ int_fct_flight_delays : month_id
-    int_dim_carrier ||--o{ int_fct_flight_delays : carrier_id
-    int_dim_airport ||--o{ int_fct_flight_delays : airport_id
+    int_dim_country ||--o{ int_fct_covid_daily : country_id
+    int_dim_date ||--o{ int_fct_covid_daily : date_id
 
-    int_dim_month {
-        int month_id PK
+    int_dim_country {
+        text country_id PK
+        bigint population
+        date last_snapshot_date
+    }
+    int_dim_date {
+        date date_id PK
         int year
         int month
+        int day
+        int day_of_week
+        text year_month
     }
-    int_dim_carrier {
-        text carrier_id PK
-        text carrier_name
-    }
-    int_dim_airport {
-        text airport_id PK
-        text airport_name
-    }
-    int_fct_flight_delays {
-        int month_id FK
-        text carrier_id FK
-        text airport_id FK
-        int arr_flights
-        int arr_del15
-        int arr_cancelled
-        int arr_diverted
-        int arr_delay
-        int carrier_delay
-        int weather_delay
-        int nas_delay
-        int security_delay
-        int late_aircraft_delay
+    int_fct_covid_daily {
+        date date_id FK
+        text country_id FK
+        bigint cases
+        bigint deaths
+        bigint recovered
+        bigint active
+        bigint critical
+        bigint tests
+        bigint new_cases
+        bigint new_deaths
+        bigint new_recovered
+        bigint new_tests
+        numeric cases_per_one_million
+        numeric deaths_per_one_million
     }
 ```
 
+**Testes de qualidade** (`models/intermediate/_intermediate.yml`):
+
+| Teste | Garante que |
+|---|---|
+| `unique` + `not_null` em `country_id` e `date_id` das dimensões | Cada país/dia aparece uma única vez |
+| `dbt_utils.unique_combination_of_columns` em `date_id` + `country_id` na fato | Não existe o mesmo país duas vezes no mesmo dia |
+| `relationships` da fato para as dimensões | Todo país e toda data da fato existem nas dimensões |
+
 ### Camada mart — tabelas para análise
 
-| Modelo | Granularidade | Principais métricas |
-|---|---|---|
-| `mart_monthly_kpis` | 1 linha por mês | voos, atrasados 15+, `pct_delayed_15m`, cancelados, desviados, minutos de atraso |
-| `mart_carrier_performance` | 1 linha por companhia | voos, atrasados 15+, `pct_delayed_15m`, cancelados, minutos de atraso |
-| `mart_airport_performance` | 1 linha por aeroporto | voos, atrasados 15+, `pct_delayed_15m`, cancelados, minutos de atraso |
-| `mart_delay_causes_long` | mês × companhia × aeroporto × causa | minutos de atraso por causa em **formato longo** (unpivot via `UNION ALL`) — ideal para gráficos filtráveis por causa |
-| `mart_delay_causes_share_month` | 1 linha por mês | % de cada causa (`pct_carrier`, `pct_weather`, `pct_nas`, `pct_security`, `pct_late_aircraft`) sobre o atraso total do mês |
+| Modelo | Granularidade | Responde a | Principais colunas |
+|---|---|---|---|
+| `mart_country_latest` | 1 linha por país | Como está cada país hoje? | totais, `case_fatality_rate` (letalidade), `recovery_rate`, `test_positivity_rate`, `pct_population_infected`, taxas por milhão, `rank_cases`, `rank_deaths_per_million` |
+| `mart_country_daily` | dia × país | Os casos estão subindo ou caindo? | `new_cases`, `new_deaths`, `new_tests`, `new_cases_7d_avg`, `new_deaths_7d_avg` (média móvel de 7 retratos) |
+| `mart_global_daily_kpis` | 1 linha por dia | Como está o grupo de países? | `countries_reporting`, totais somados, `new_cases`, `new_deaths`, letalidade e positividade consolidadas |
 
-Todos os percentuais usam `CASE WHEN total = 0 THEN 0` para evitar divisão por zero.
+Todas as divisões usam `nullif(divisor, 0)`: se o divisor for zero, o resultado é `null` em vez de erro.
 
 ### Pacotes (`packages.yml`)
 
-- **dbt_utils** — macros como `generate_surrogate_key`, `unpivot`, `date_spine`.
-- **dbt_expectations** — testes de qualidade (ranges, nulos, valores aceitos). Depende do `dbt_date`, que também é instalado pelo `dbt deps`.
+- **dbt_utils** — macros e testes utilitários (usado no teste `unique_combination_of_columns`).
+- **dbt_expectations** — testes de qualidade avançados (ranges, nulos, valores aceitos). Depende do `dbt_date`, que também é instalado pelo `dbt deps`.
 
 ---
 
@@ -312,7 +326,7 @@ O dbt é instalado em um **virtualenv separado** (`/usr/local/airflow/dbt_venv`)
 Pacotes instalados no Python **principal** do Airflow:
 
 - `astronomer-cosmos` — integração dbt + Airflow.
-- `apache-airflow-providers-postgres` — habilita o tipo de conexão **Postgres** na interface do Airflow (sem ele, a opção não aparece).
+- `apache-airflow-providers-postgres` — traz o `PostgresHook` (usado na `load_raw`) e habilita o tipo de conexão **Postgres** na interface do Airflow.
 
 > O arquivo precisa se chamar exatamente `requirements.txt`; o Astro ignora qualquer outro nome.
 
@@ -320,7 +334,7 @@ Pacotes instalados no Python **principal** do Airflow:
 
 Monta a pasta `../02.data_warehouse/dw` em `/usr/local/airflow/dbt/dw` nos containers **scheduler** e **dag-processor**, para que o Cosmos consiga ler e executar o projeto dbt (e alterações nos modelos apareçam sem rebuild da imagem).
 
-> A pasta `include/` (onde fica o CSV) já é montada automaticamente pelo Astro em `/usr/local/airflow/include`.
+> A pasta `include/` (onde ficam os CSVs) já é montada automaticamente pelo Astro em `/usr/local/airflow/include`.
 
 ### `.env`
 
@@ -330,20 +344,29 @@ Aumenta os limites de tempo para o Airflow ler a DAG (`AIRFLOW__CORE__DAGBAG_IMP
 
 Muda a porta do Postgres **interno** do Airflow (metadados) para `5435`, evitando conflito com o Postgres do Windows (`5432`) e com o Data Warehouse (`5433`).
 
-### `dags/dag.py` — ingestão + dbt
+### `dags/dag.py` — extração + carga + dbt
 
-A DAG tem duas partes, executadas em sequência (`load_csv() >> transform`):
+A DAG tem três partes, executadas em sequência (`load_raw(extract_api()) >> transform`):
 
-**1. `load_csv` (ingestão)** — task Python que usa o `PostgresHook` com a mesma conexão do ambiente:
+**1. `extract_api` (extração)**
 
-1. `create schema if not exists raw` + `create table if not exists raw.airline_delay_cause`;
-2. `truncate table raw.airline_delay_cause`;
-3. `COPY ... FROM STDIN (FORMAT csv, HEADER true)` com o arquivo do dia;
+1. Para cada país da lista `PAISES`, faz `GET /v3/covid-19/countries/{país}?strict=true` (`strict` exige o nome exato do país);
+2. valida se todas as colunas de `COLUNAS_API` vieram na resposta;
+3. grava `include/data/covid_countries_<data>.csv` com `snapshot_date` + as 16 colunas;
+4. devolve **apenas o caminho do arquivo e a data** para a próxima task (via XCom — os dados em si não trafegam pelo Airflow).
+
+Não há `try/except`: se um país falhar (timeout, erro HTTP, coluna ausente), a task falha e o Airflow tenta de novo (`retries: 2`). Carregar 19 de 20 países em silêncio seria pior do que falhar.
+
+**2. `load_raw` (carga)** — usa o `PostgresHook` com a mesma conexão do ambiente:
+
+1. `create schema if not exists raw` + `create table if not exists raw.covid_countries`;
+2. `delete from raw.covid_countries where snapshot_date = <dia>`;
+3. `COPY ... FROM STDIN (FORMAT csv, HEADER true)` com o CSV do dia;
 4. imprime a quantidade de linhas carregadas no log.
 
-Tudo acontece em **uma única transação**: se o arquivo do dia vier com problema e o `COPY` falhar, o `TRUNCATE` é desfeito e a tabela mantém os dados do dia anterior.
+Tudo em **uma única transação**: se o `COPY` falhar, o `DELETE` é desfeito. Como só o dia atual é apagado, a task é **idempotente** (rodar duas vezes no mesmo dia não duplica) e os dias anteriores são preservados.
 
-**2. `dbt_dw` (transformação)** — não há nenhum `dbt run` escrito explicitamente: quem executa o dbt é o **Cosmos**, através da classe `DbtTaskGroup`.
+**3. `dbt_dw` (transformação)** — não há nenhum `dbt run` escrito explicitamente: quem executa o dbt é o **Cosmos**, através da classe `DbtTaskGroup`.
 
 | Bloco | O que faz |
 |---|---|
@@ -357,7 +380,7 @@ Tudo acontece em **uma única transação**: se o arquivo do dia vier com proble
 
 Ao carregar o arquivo, o Cosmos lê o projeto dbt e gera automaticamente:
 
-- um grupo de tasks por modelo (`run` e, quando houver testes declarados, `test`);
+- um grupo de tasks por modelo (`run` e, quando há testes declarados, `test`);
 - as dependências entre elas, seguindo os `ref()` e `source()` do SQL.
 
 Nos **logs** de cada task, na interface do Airflow, dá para ver o comando dbt completo que foi montado e a saída do dbt.
@@ -388,9 +411,64 @@ cd 01.local_setup
 docker compose up -d
 ```
 
-### 2. (Opcional) Rodar o dbt manualmente
+### 2. Subir o Airflow
 
-> Requer que a tabela `raw.airline_delay_cause` já exista, ou seja, que a DAG tenha rodado ao menos uma vez (passo 5).
+Crie o arquivo `03.airflow/.env`:
+
+```env
+AIRFLOW__CORE__DAGBAG_IMPORT_TIMEOUT=300
+AIRFLOW__DAG_PROCESSOR__DAG_FILE_PROCESSOR_TIMEOUT=300
+```
+
+Depois:
+
+```bash
+cd 03.airflow
+astro dev start
+```
+
+A interface fica em **http://localhost:8080**.
+
+> Sempre que alterar `requirements.txt`, `packages.txt`, `Dockerfile`, `.env` ou `docker-compose.override.yml`, rode `astro dev restart`. Mudanças no `dag.py` ou nos `.sql` do dbt são detectadas sozinhas.
+
+### 3. Criar a conexão no Airflow
+
+Em **Admin → Connections → Add Connection**:
+
+| Campo | Valor |
+|---|---|
+| Connection Id | `docker_postgres_db` |
+| Connection Type | `Postgres` |
+| Host | `host.docker.internal` |
+| Database | `dbt_db` |
+| Login | valor de `DBT_USER` |
+| Password | valor de `DBT_PASSWORD` |
+| Port | `5433` |
+
+> O Host é `host.docker.internal` (e não `localhost`) porque o Airflow roda dentro de um container: `localhost` apontaria para o próprio container do Airflow.
+
+### 4. Executar a DAG
+
+Pela interface: abra a DAG **`dag_dw_dev`**, ative-a (chave ao lado do nome) e clique em **Trigger**. Ou pelo terminal, dentro de `03.airflow`:
+
+```bash
+astro dev run dags unpause dag_dw_dev
+astro dev run dags trigger dag_dw_dev
+```
+
+Nos logs, a `extract_api` mostra `20 países gravados em ...` e a `load_raw` mostra `Linhas carregadas para <data>: 20`. Ao final:
+
+```sql
+select * from raw.covid_countries order by snapshot_date, country;
+select * from public.mart_country_latest order by rank_deaths_per_million;
+select * from public.mart_global_daily_kpis order by snapshot_date;
+```
+
+Para cancelar uma execução em andamento: abra a execução → **Mark Run as… → Failed**. Para rodar novamente: **Trigger** (do zero) ou **Clear Run → Only failed tasks** (retoma de onde parou).
+
+### 5. (Opcional) Rodar o dbt manualmente
+
+> Requer que a tabela `raw.covid_countries` já exista, ou seja, que a DAG tenha rodado ao menos uma vez.
 
 Crie `02.data_warehouse/dw/profiles.yml` (ele é ignorado pelo git):
 
@@ -415,60 +493,19 @@ E execute:
 cd 01.local_setup
 uv sync
 cd ../02.data_warehouse/dw
-uv run --project ../../01.local_setup dbt deps
-uv run --project ../../01.local_setup dbt build --profiles-dir .
+uv run --project ../../01.local_setup dbt deps --profiles-dir .
+uv run --project ../../01.local_setup dbt build --profiles-dir .                                   # tudo
+uv run --project ../../01.local_setup dbt build --select stg_covid_countries+ --profiles-dir .     # staging e o que depende dele
+uv run --project ../../01.local_setup dbt show --select mart_country_latest --profiles-dir .       # pré-visualiza o resultado
 ```
 
-### 3. Subir o Airflow
+> **Windows:** defina `PYTHONUTF8=1` (uma vez, no PowerShell: `[Environment]::SetEnvironmentVariable("PYTHONUTF8", "1", "User")` e reabra o terminal). Sem isso, acentos nos arquivos `.yml` podem causar `UnicodeDecodeError: 'charmap' codec can't decode byte`.
 
-Coloque o CSV em `03.airflow/include/data/airline_delay_cause.csv` e crie o arquivo `03.airflow/.env`:
+### O que esperar nos primeiros dias
 
-```env
-AIRFLOW__CORE__DAGBAG_IMPORT_TIMEOUT=300
-AIRFLOW__DAG_PROCESSOR__DAG_FILE_PROCESSOR_TIMEOUT=300
-```
-
-Depois:
-
-```bash
-cd 03.airflow
-astro dev start
-```
-
-A interface fica em **http://localhost:8080**.
-
-> Sempre que alterar `requirements.txt`, `packages.txt`, `Dockerfile`, `.env` ou `docker-compose.override.yml`, rode `astro dev restart`.
-
-### 4. Criar a conexão no Airflow
-
-Em **Admin → Connections → Add Connection**:
-
-| Campo | Valor |
-|---|---|
-| Connection Id | `docker_postgres_db` |
-| Connection Type | `Postgres` |
-| Host | `host.docker.internal` |
-| Database | `dbt_db` |
-| Login | valor de `DBT_USER` |
-| Password | valor de `DBT_PASSWORD` |
-| Port | `5433` |
-
-> O Host é `host.docker.internal` (e não `localhost`) porque o Airflow roda dentro de um container: `localhost` apontaria para o próprio container do Airflow.
-
-### 5. Executar a DAG
-
-Ative e dispare a DAG **`dag_dw_dev`** na interface. No log da task `load_csv` aparece `Linhas carregadas: ...`. Ao final, a tabela bruta estará em `dbt_db.raw` e os modelos em `dbt_db.public`:
-
-```sql
-select count(*) from raw.airline_delay_cause;
-select * from public.mart_monthly_kpis order by month_id;
-```
-
-### Rotina diária
-
-Basta substituir `03.airflow/include/data/airline_delay_cause.csv` pelo arquivo novo (mantendo o nome). Na próxima execução agendada, a DAG recarrega a tabela raw e reconstrói todas as camadas.
-
-Para cancelar uma execução em andamento: abra a execução → **Mark Run as… → Failed**. Para rodar novamente: **Trigger** (do zero) ou **Clear Run → Only failed tasks** (retoma de onde parou).
+- **Dia 1:** `new_cases`, `new_deaths` e as médias móveis ficam vazios — ainda não há retrato anterior para comparar.
+- **A partir do dia 2:** as variações diárias passam a ser calculadas; as médias de 7 dias ficam representativas após uma semana.
+- Muitos países não atualizam mais os dados de COVID com frequência, então `new_cases = 0` é comum e não indica erro no pipeline.
 
 ---
 
@@ -481,7 +518,7 @@ A DAG suporta dois ambientes, escolhidos pela **Variable** `dbt_env` do Airflow 
 | `dev` (padrão) | `docker_postgres_db` | PostgreSQL local (Docker) | `dag_dw_dev` |
 | `prod` | `railway_postgres_db` | PostgreSQL remoto (Railway) | `dag_dw_prod` |
 
-Para usar prod, crie a conexão `railway_postgres_db` com os dados do banco no Railway e defina `dbt_env = prod`. Qualquer outro valor gera erro na importação da DAG.
+A mesma conexão é usada pela `load_raw` e pelo dbt: em dev tudo vai para o banco local; em prod, para o remoto. Para usar prod, crie a conexão `railway_postgres_db` e defina `dbt_env = prod`. Qualquer outro valor gera erro na importação da DAG.
 
 ---
 
@@ -502,9 +539,12 @@ Para usar prod, crie a conexão `railway_postgres_db` com os dados do banco no R
 |---|---|---|
 | Tipo de conexão **Postgres** não aparece no Airflow | `apache-airflow-providers-postgres` não instalado (ou `requirements.txt` com nome errado) | Adicionar ao `requirements.txt` e rodar `astro dev restart` |
 | `connection refused` ao conectar no banco | Host `localhost` na conexão, ou container `dbt_postgres` parado | Usar `host.docker.internal:5433` e `docker compose up -d` em `01.local_setup` |
-| DAG não aparece / erro de import | Projeto dbt não montado ou `dbt_env` inválido | Conferir `docker-compose.override.yml` e a variável `dbt_env` (`dev` ou `prod`) |
+| DAG não aparece / erro de import | Projeto dbt não montado, `ref()` para modelo inexistente ou `dbt_env` inválido | `astro dev run dags list-import-errors`; conferir `docker-compose.override.yml`, os `ref()` e a variável `dbt_env` |
 | `DagBag import timeout ... after 30.0s` | Cosmos demora na primeira leitura do projeto dbt | Criar o `03.airflow/.env` com os timeouts de 300 s e rodar `astro dev restart` |
-| `load_csv` falha com `No such file or directory` | CSV fora do lugar ou com outro nome | Salvar em `03.airflow/include/data/airline_delay_cause.csv` |
-| `relation "raw.airline_delay_cause" does not exist` ao rodar o dbt manualmente | A DAG ainda não rodou nenhuma vez | Disparar a DAG (a `load_csv` cria a tabela) |
-| DAG demora muitos minutos na carga | Uso de `dbt seed` para arquivos grandes | Carregar via `COPY` (task `load_csv`), como neste projeto |
+| `extract_api` falha com `404 Not Found` | Nome de país não reconhecido pela API (com `strict=true`) | Usar o nome exato da API ou o código ISO de 2 letras (ex.: `US`, `GB`, `KR`) |
+| `extract_api` falha com `colunas ausentes na resposta` | A API mudou/removeu um campo | Ajustar `COLUNAS_API`, o `RAW_DDL` e o staging |
+| `relation "raw.covid_countries" does not exist` ao rodar o dbt manualmente | A DAG ainda não rodou nenhuma vez | Disparar a DAG (a `load_raw` cria a tabela) |
+| `column "casesperonemillion" does not exist` | SQL usando os nomes camelCase da API | Na raw as colunas são snake_case (`cases_per_one_million`) |
+| `UnicodeDecodeError: 'charmap' codec` ao rodar o dbt no Windows | Python lendo arquivos em `cp1252` | Definir `PYTHONUTF8=1` e reabrir o terminal |
+| `new_cases` vazio | Primeiro dia de carga | Normal: aparece a partir do segundo retrato |
 | Conflito de porta ao subir containers | Outro serviço usando 5432/5433/5435 | Ajustar as portas no `docker-compose.yml` ou em `.astro/config.yaml` |

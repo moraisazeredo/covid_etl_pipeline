@@ -3,7 +3,7 @@ version: 2
 
 sources:
   - name: raw
-    schema: raw   # Schema criado pela task load_csv da DAG (fora do dbt)
+    schema: raw   # Schema criado pela task load_raw da DAG (fora do dbt)
     tables:
-      - name: airline_delay_cause
-        description: "CSV do BTS carregado diariamente pelo Airflow via COPY (truncate + load)"
+      - name: covid_countries
+        description: "Retrato diário da API disease.sh (20 países); 1 linha por snapshot_date + country"
