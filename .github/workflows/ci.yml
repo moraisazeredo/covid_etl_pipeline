@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+env:
+  DBT: ../../01.local_setup/.venv/bin/dbt  # dbt instalado pelo uv sync em 01.local_setup
+
 jobs:
   dbt-compile:
     name: Compilar modelos dbt (validação de sintaxe)
@@ -24,11 +27,11 @@ jobs:
         run: pip install uv
 
       - name: Instalar dependências Python
-        working-directory: 1_local_setup
+        working-directory: 01.local_setup
         run: uv sync
 
       - name: Criar profiles.yml para validação
-        working-directory: 2_data_warehouse/dw
+        working-directory: 02.data_warehouse/dw
         run: |
           cat > profiles.yml << 'EOF'
           dw:
@@ -46,15 +49,15 @@ jobs:
           EOF
 
       - name: Instalar pacotes dbt (dbt deps)
-        working-directory: 2_data_warehouse/dw
-        run: ../../1_local_setup/.venv/bin/dbt deps --profiles-dir .
+        working-directory: 02.data_warehouse/dw
+        run: $DBT deps --profiles-dir .
 
       - name: Validar sintaxe dos modelos dbt (dbt parse)
-        working-directory: 2_data_warehouse/dw
-        run: ../../1_local_setup/.venv/bin/dbt parse --profiles-dir .
+        working-directory: 02.data_warehouse/dw
+        run: $DBT parse --profiles-dir .
 
   dbt-build:
-    name: Executar pipeline completo (seed + run + test)
+    name: Executar pipeline completo (run + test)
     runs-on: ubuntu-latest
     needs: dbt-compile
 
@@ -86,11 +89,11 @@ jobs:
         run: pip install uv
 
       - name: Instalar dependências Python
-        working-directory: 1_local_setup
+        working-directory: 01.local_setup
         run: uv sync
 
       - name: Criar profiles.yml apontando para o PostgreSQL do CI
-        working-directory: 2_data_warehouse/dw
+        working-directory: 02.data_warehouse/dw
         run: |
           cat > profiles.yml << 'EOF'
           dw:
@@ -107,29 +110,54 @@ jobs:
                 threads: 4
           EOF
 
+      # No projeto real a tabela raw é criada pela task load_raw da DAG (Airflow).
+      # No CI criamos a mesma estrutura (vazia) para os models conseguirem rodar.
+      - name: Criar tabela raw.covid_countries
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -p 5433 -U postgres -d dbt_db -v ON_ERROR_STOP=1 << 'EOF'
+          create schema if not exists raw;
+          create table if not exists raw.covid_countries (
+              snapshot_date             date,
+              country                   text,
+              cases                     numeric,
+              deaths                    numeric,
+              recovered                 numeric,
+              active                    numeric,
+              critical                  numeric,
+              cases_per_one_million     numeric,
+              deaths_per_one_million    numeric,
+              tests                     numeric,
+              tests_per_one_million     numeric,
+              population                numeric,
+              one_case_per_people       numeric,
+              one_death_per_people      numeric,
+              one_test_per_people       numeric,
+              active_per_one_million    numeric,
+              recovered_per_one_million numeric
+          );
+          EOF
+
       - name: Instalar pacotes dbt (dbt deps)
-        working-directory: 2_data_warehouse/dw
-        run: ../../1_local_setup/.venv/bin/dbt deps --profiles-dir .
+        working-directory: 02.data_warehouse/dw
+        run: $DBT deps --profiles-dir .
 
       - name: Testar conexão com o banco (dbt debug)
-        working-directory: 2_data_warehouse/dw
-        run: ../../1_local_setup/.venv/bin/dbt debug --profiles-dir .
-
-      - name: Carregar dados brutos (dbt seed)
-        working-directory: 2_data_warehouse/dw
-        run: ../../1_local_setup/.venv/bin/dbt seed --profiles-dir .
+        working-directory: 02.data_warehouse/dw
+        run: $DBT debug --profiles-dir .
 
       - name: Executar models e testes (dbt build)
-        working-directory: 2_data_warehouse/dw
-        run: ../../1_local_setup/.venv/bin/dbt build --profiles-dir . --exclude-resource-type seed
+        working-directory: 02.data_warehouse/dw
+        run: $DBT build --profiles-dir .
 
       - name: Gerar documentação dbt
-        working-directory: 2_data_warehouse/dw
-        run: ../../1_local_setup/.venv/bin/dbt docs generate --profiles-dir .
+        working-directory: 02.data_warehouse/dw
+        run: $DBT docs generate --profiles-dir .
 
       - name: Publicar artefatos de documentação
         uses: actions/upload-artifact@v4
         with:
           name: dbt-docs
-          path: 2_data_warehouse/dw/target/
+          path: 02.data_warehouse/dw/target/
           retention-days: 7
