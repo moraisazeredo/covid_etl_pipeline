@@ -17,7 +17,6 @@ Pipeline de dados ponta a ponta sobre **COVID-19 em 20 países**: todos os dias,
 9. [Como executar o projeto do zero](#como-executar-o-projeto-do-zero)
 10. [Ambientes dev e prod](#ambientes-dev-e-prod)
 11. [Portas utilizadas](#portas-utilizadas)
-12. [Problemas comuns](#problemas-comuns)
 
 ---
 
@@ -353,9 +352,6 @@ A DAG tem três partes, executadas em sequência (`load_raw(extract_api()) >> tr
 1. Para cada país da lista `PAISES`, faz `GET /v3/covid-19/countries/{país}?strict=true` (`strict` exige o nome exato do país);
 2. valida se todas as colunas de `COLUNAS_API` vieram na resposta;
 3. grava `include/data/covid_countries_<data>.csv` com `snapshot_date` + as 16 colunas;
-4. devolve **apenas o caminho do arquivo e a data** para a próxima task (via XCom — os dados em si não trafegam pelo Airflow).
-
-Não há `try/except`: se um país falhar (timeout, erro HTTP, coluna ausente), a task falha e o Airflow tenta de novo (`retries: 2`). Carregar 19 de 20 países em silêncio seria pior do que falhar.
 
 **2. `load_raw` (carga)** — usa o `PostgresHook` com a mesma conexão do ambiente:
 
@@ -364,7 +360,7 @@ Não há `try/except`: se um país falhar (timeout, erro HTTP, coluna ausente), 
 3. `COPY ... FROM STDIN (FORMAT csv, HEADER true)` com o CSV do dia;
 4. imprime a quantidade de linhas carregadas no log.
 
-Tudo em **uma única transação**: se o `COPY` falhar, o `DELETE` é desfeito. Como só o dia atual é apagado, a task é **idempotente** (rodar duas vezes no mesmo dia não duplica) e os dias anteriores são preservados.
+Tudo em **uma única transação**: se o `COPY` falhar, o `DELETE` é desfeito. Como só o dia atual é apagado, a task não roda duas vezes no mesmo dia e não duplica, fazendo com que os dias anteriores sejam preservados.
 
 **3. `dbt_dw` (transformação)** — não há nenhum `dbt run` escrito explicitamente: quem executa o dbt é o **Cosmos**, através da classe `DbtTaskGroup`.
 
